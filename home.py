@@ -6,22 +6,19 @@ HOMES_COUNT = 1
 START_CONSUMPTION_RATE = 1.6
 START_PRODUCTION_RATE = 1
 TRADE_POLICY = "GIVE_ONLY" # or "SELL_ONLY" or "SELL_IF_NONE" ()
-START_ENERGY = 5
 
 # Synchronization primitives
 awaiting_takers = Event()
-home_counter = Semaphore(0)
 givers_advertisment = Event()
 taker = Lock()
 sync_event = Event()
 lock = Lock()
 
-# Sync object
-
 # TODO LIST
 # - replace the TRADE_POLICY strings with vars to avoid mistakes (?)
 # - catch SIGINT to close msq queue
-# Handle the SIGINT error if it is stuck on semaphore or event (check docs) when simulation is stopped
+# - Handle the SIGINT error if it is stuck on semaphore or event (check docs) when simulation is stopped
+# - If lock works inside MsgQueueCountdown, then put it inside
 
 KEY = 257
 msg_queue = MessageQueue(KEY, flags=IPC_CREAT)
@@ -46,7 +43,7 @@ class MsgQueueCountdown:
         # Init the countdown
         self.reset()
 
-    # Decrements the value from the queue and returns True if the countdown ends.
+    # Decrement the value from the queue and returns True if the countdown ends.
     # The countdown then should be reset before reuse.
     def decrement(self) -> bool:
         #with self.lock:
@@ -61,10 +58,11 @@ class MsgQueueCountdown:
         self.msg_queue.send(str(current_value).encode(), type=self.MSG_TYPE)
         return False
 
+    # Make the countdown ready for subsequent decrements.
     def reset(self):
         self.msg_queue.send(str(self.start_value).encode(), type=self.MSG_TYPE)
 
-
+# Sync object
 countdown = MsgQueueCountdown(HOMES_COUNT, msg_queue)
 
 class Home(Process):
@@ -100,7 +98,7 @@ class Home(Process):
             if energy_delta > 0 and self.trade_policy == "GIVE_ONLY" or self.trade_policy == "SELL_IF_NONE":
                 # GIVER
                 givers_advertisment.clear() # Takers, if any, will be waiting for givers
-            elif energy_delta < 0:
+            elif energy_delta < 0: # TAKER
                 awaiting_takers.clear() # Givers, if any, will be waiting for takers
 
             self.sync_all_homes()
@@ -111,29 +109,31 @@ class Home(Process):
                 while True:
                     givers_advertisment.wait()
                     taker.acquire()
-                    if msg_queue.current_messages == 0: # if atomic, then takers lock is not needed
-                        # All surplus advertisments were taken homes, buy on market
-                        # No home with surplus remaining this round, need to buy from market
-                        # TODO: Market transaction (always)
-                        taker.release()
-                        break
 
-                    surplus_advertisment, giver_id = msg_queue.receive()
+                    try:
+                        # Using -HOMES_COUNT as msg type, and the convention of giving each home an id starting
+                        # from 1 to HOMES_COUNT, we can use the remaining types for other purposes (e.g. countdown)
+                        surplus_advertisment, giver_id = msg_queue.receive(type=-HOMES_COUNT, block=False)
+                        print(self.id, "received energy from home", giver_id)
+                    except BusyError:
+                        # All surplus advertisments were taken homes, buy on market
+                        # TODO: Market transaction (always)
+                        break
                     surplus = float(surplus_advertisment.decode())
                     energy_received = min(surplus, -energy_delta) # energy_delta is < 0
                     remaining_energy = surplus - energy_received
 
-                    if remaining_energy > 0: # Don't put in the msg_queue empty packets of energy
+                    # Put back in the msg queue only if the 'packet' still contains energy
+                    if remaining_energy > 0:
+                        # Surplus from other home was enough to meed need of energy.
                         msg_queue.send(str(remaining_energy).encode(),type=giver_id)
-                    taker.release()
-                    energy_delta += energy_received
-                    print(self.id, "received energy from home", giver_id)
-                    if energy_delta >= 0:
-                        # Surplus from other home was more than enough for energy need.
                         break
                     else:
-                        # Surplus from other home was insufficient, check for another one
-                        pass
+                        energy_delta += energy_received
+                         # Surplus from other home was insufficient, check for another one
+                        continue
+                taker.release()
+                awaiting_takers.set() # PROBLEM HERE
 
             if energy_delta > 0:
 
