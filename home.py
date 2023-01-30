@@ -19,6 +19,7 @@ lock = Lock()
 # - catch SIGINT to close msq queue
 # - Handle the SIGINT error if it is stuck on semaphore or event (check docs) when simulation is stopped
 # - If lock works inside MsgQueueCountdown, then put it inside
+# - Make sure that no lock acquire/release is missing in MsgQueueCounter
 
 KEY = 257
 msg_queue = MessageQueue(KEY, flags=IPC_CREAT)
@@ -28,46 +29,40 @@ temperature = 25 # °C
 # ----------
 
 # Represents an atomic countdown stored in a message queue.
-class MsgQueueCountdown:
+class MsgQueueCounter:
 
     # lock = Lock()
 
-    # Type of the message used to store the countdown, must be unused by other interactions with the queue
+    # Type of the message used to store the counter, must be unused by other interactions with the queue
     MSG_TYPE = 999999
 
-    def __init__(self, start_value, queue) -> None:
+    def __init__(self, start_value, queue):
         self.countdown = start_value
         self.start_value = start_value
         self.msg_queue = queue
 
-        # Init the countdown
-        self.reset()
+        self.setValue(start_value)
 
-    # Decrement the value from the queue and returns True if the countdown ends.
-    # The countdown then should be reset before reuse.
-    def decrement(self) -> bool:
+    # Increment by given amount and returns its updated value.
+    def increment(self, amount) -> int:
         #with self.lock:
         with lock:
             current_value = int(msg_queue.receive()[0].decode(), type=self.MSG_TYPE)
-            self.countdown = current_value - 1
+            updated_value = current_value + amount
+            self.countdown = updated_value
 
-        if current_value == 0:
-            # When the countdown ends, the queue is freed of any coutdown-related data.
-            return True
+        self.msg_queue.send(str(updated_value).encode(), type=self.MSG_TYPE)
+        return updated_value
 
-        self.msg_queue.send(str(current_value).encode(), type=self.MSG_TYPE)
-        return False
-
-    # Make the countdown ready for subsequent decrements.
-    def reset(self):
-        self.msg_queue.send(str(self.start_value).encode(), type=self.MSG_TYPE)
+    def setValue(self, value):
+        self.increment(value - self.countdown)
 
 # Sync object
-countdown = MsgQueueCountdown(HOMES_COUNT, msg_queue)
+atomic_counter = MsgQueueCounter(HOMES_COUNT, msg_queue)
 
 class Home(Process):
 
-    def __init__(self, id : int, trade_policy : str) -> None:
+    def __init__(self, id : int, trade_policy : str):
         super().__init__()
         self.id = id
         self.consumption_rate = START_CONSUMPTION_RATE
@@ -78,8 +73,8 @@ class Home(Process):
     # i.e. tick N (present) is not mixed with ticks N-1 (past) or N+1 (future).
     # The on_sync function will be called only once, just before releasing all processes.
     def sync_all_homes(on_sync = (lambda: None)):
-        if countdown.decrement():
-            countdown.reset()
+        if atomic_counter.increment(1) == HOMES_COUNT:
+            atomic_counter.setValue(0)
             on_sync()
             sync_event.set()
 
@@ -90,7 +85,7 @@ class Home(Process):
         givers_advertisment.set()
         awaiting_takers.set()
 
-    def run(self) -> None:
+    def run(self):
         while True:
             self.sync_all_homes(self.on_sync)
             energy_delta = self.production_rate - self.consumption_rate
@@ -106,13 +101,15 @@ class Home(Process):
             # TAKER
             if energy_delta < 0:
                 # Ask other homes for giveaway, wait for a reply, and if none, buy from market
+                atomic_counter.increment(1)
                 while True:
                     givers_advertisment.wait()
                     taker.acquire()
 
                     try:
-                        # Using -HOMES_COUNT as msg type, and the convention of giving each home an id starting
-                        # from 1 to HOMES_COUNT, we can use the remaining types for other purposes (e.g. countdown)
+                        # Using -HOMES_COUNT as msg type, and the convention of giving each home an id in the
+                        # range [1,HOMES_COUNT], we can use the remaining types for other purposes
+                        # (e.g. countdown), because we only retrieve messages which types are <= HOMES_COUNT.
                         surplus_advertisment, giver_id = msg_queue.receive(type=-HOMES_COUNT, block=False)
                         print(self.id, "received energy from home", giver_id)
                     except BusyError:
@@ -132,8 +129,10 @@ class Home(Process):
                         energy_delta += energy_received
                          # Surplus from other home was insufficient, check for another one
                         continue
+                if atomic_counter.increment(-1) == 0:
+                    awaiting_takers.set()
+
                 taker.release()
-                awaiting_takers.set() # PROBLEM HERE
 
             if energy_delta > 0:
 
@@ -155,8 +154,6 @@ class Home(Process):
                     pass # check in mq for 'in need' request. If none, sell immediately
 
             print(f"Energy remaining: {self.energy:.2f}")
-
-
 
 if __name__ == "__main__":
     timestamp = 0
