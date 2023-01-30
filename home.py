@@ -1,7 +1,6 @@
-import os
 from sysv_ipc import MessageQueue, IPC_CREAT, BusyError
 from multiprocessing import Process, Semaphore, Event, Lock
-from time import sleep
+from math import intm
 
 HOMES_COUNT = 1
 START_CONSUMPTION_RATE = 1.6
@@ -10,25 +9,63 @@ TRADE_POLICY = "GIVE_ONLY" # or "SELL_ONLY" or "SELL_IF_NONE" ()
 START_ENERGY = 5
 
 # Synchronization primitives
-awaiting_taker_response = Event()
+awaiting_takers = Event()
 home_counter = Semaphore(0)
 givers_advertisment = Event()
 taker = Lock()
-gate1 = Event()
-gate2 = Event()
-gate3 = Event()
+sync_event = Event()
+lock = Lock()
+
+# Sync object
 
 # TODO LIST
 # - replace the TRADE_POLICY strings with vars to avoid mistakes (?)
 # - catch SIGINT to close msq queue
+# Handle the SIGINT error if it is stuck on semaphore or event (check docs) when simulation is stopped
 
-KEY = 532
+KEY = 257
 msg_queue = MessageQueue(KEY, flags=IPC_CREAT)
 
 # weather hard-coded
 temperature = 25 # °C
 # ----------
 
+# Represents an atomic countdown stored in a message queue.
+class MsgQueueCountdown:
+
+    # lock = Lock()
+
+    # Type of the message used to store the countdown, must be unused by other interactions with the queue
+    MSG_TYPE = 999999
+
+    def __init__(self, start_value, queue) -> None:
+        self.countdown = start_value
+        self.start_value = start_value
+        self.msg_queue = queue
+
+        # Init the countdown
+        self.reset()
+
+    # Decrements the value from the queue and returns True if the countdown ends.
+    # The countdown then should be reset before reuse.
+    def decrement(self) -> bool:
+        #with self.lock:
+        with lock:
+            current_value = int(msg_queue.receive()[0].decode(), type=self.MSG_TYPE)
+            self.countdown = current_value - 1
+
+        if current_value == 0:
+            # When the countdown ends, the queue is freed of any coutdown-related data.
+            return True
+
+        self.msg_queue.send(str(current_value).encode(), type=self.MSG_TYPE)
+        return False
+
+    def reset(self):
+        self.msg_queue.send(str(self.start_value).encode(), type=self.MSG_TYPE)
+
+
+countdown = MsgQueueCountdown(HOMES_COUNT, msg_queue)
 
 class Home(Process):
 
@@ -39,35 +76,34 @@ class Home(Process):
         self.production_rate = START_PRODUCTION_RATE
         self.trade_policy = trade_policy
 
-    # Allows for home sync. Calling this each round ensures the ticks do not mix,
-    # i.e. tick N (present) is not mixed with ticks N-1 (past) or N+1 (future)
-    def sync_for_next_tick(inter_gate_operation = (lambda: None)):
-        home_counter.release()
-        gate1.wait()
-        inter_gate_operation()
-        home_counter.release()
-        gate2.wait()    
+    # Allows for home to sync. Calling this each round ensures the ticks do not mix,
+    # i.e. tick N (present) is not mixed with ticks N-1 (past) or N+1 (future).
+    # The on_sync function will be called only once, just before releasing all processes.
+    def sync_all_homes(on_sync = (lambda: None)):
+        if countdown.decrement():
+            countdown.reset()
+            on_sync()
+            sync_event.set()
+
+        sync_event.wait()
 
     def on_sync():
+        # We assume that there will be no takers or givers by default
         givers_advertisment.set()
-        awaiting_taker_response.set()
+        awaiting_takers.set()
 
     def run(self) -> None:
         while True:
-            self.sync_for_next_tick(self.on_sync)
+            self.sync_all_homes(self.on_sync)
             energy_delta = self.production_rate - self.consumption_rate
 
             if energy_delta > 0 and self.trade_policy == "GIVE_ONLY" or self.trade_policy == "SELL_IF_NONE":
                 # GIVER
-                givers_advertisment.clear() # indicates to the takers the presence of givers
+                givers_advertisment.clear() # Takers, if any, will be waiting for givers
             elif energy_delta < 0:
-                awaiting_taker_response.clear() # indicates to the givers the presence of takers
-                # home_counter.release()
-                # start_sync.wait() # wait for every home to get there
+                awaiting_takers.clear() # Givers, if any, will be waiting for takers
 
-            gate3.clear()
-            home_counter.release()
-            gate3.wait()
+            self.sync_all_homes()
 
             # TAKER
             if energy_delta < 0:
@@ -98,9 +134,6 @@ class Home(Process):
                     else:
                         # Surplus from other home was insufficient, check for another one
                         pass
-                # Doing this will prevent houses which resolved their DeltaE < 0 to reach the end of the while,
-                # where other homes meet
-                # continue
 
             if energy_delta > 0:
 
@@ -109,7 +142,7 @@ class Home(Process):
                     msg_queue.send(surplus_advertisment.encode(), type=self.id)
 
                     givers_advertisment.set()
-                    awaiting_taker_response.wait()
+                    awaiting_takers.wait()
                     try:
                         remaining_energy = float(msg_queue.receive(type=self.id, block=False)[0].decode())
                     except BusyError:
@@ -121,52 +154,14 @@ class Home(Process):
                 else: # SELL_IF_NONE
                     pass # check in mq for 'in need' request. If none, sell immediately
 
-                # Doing this will prevent houses which resolved their DeltaE > 0 to reach the end
-                # of the while,where other homes meet (might want to do this with givers only),
-                # thus prevent a giver to increase/release the home_counter
-                continue
-
-            if energy_delta == 0:
-                # This home has either sold surplus energy to the market (SELL_ONLY or SELL_IF_NO_TAKERS when
-                # no needy homes are remaining) or just had energy_delta == 0 from start, or was a needy
-                # home but found all of what it needed with other homes or on the market
-                pass
-
             print(f"Energy remaining: {self.energy:.2f}")
 
 
 
 if __name__ == "__main__":
     timestamp = 0
-    # Events to set by default
-    # givers_advertisment.set()
-    # awaiting_givers_advertisment.set()
 
     homes = [Home(id=(i+1)) for i in range(HOMES_COUNT)]
     for h in homes:
         h.start()
     print("~~", timestamp, "~~")
-
-    counter = 0
-    increment = 1
-
-    # count advertisments every time a house sets the flag !atomically!, it increases a var by 1
-    while True:
-        # TODO: Handle the SIGINT error if it is stuck here when simulation is stopped
-        home_counter.acquire()
-        counter += increment
-        if counter == HOMES_COUNT:
-            givers_advertisment.set()
-            # Release all givers which may be waiting for takers reponse
-            # awaiting_taker_response.set()
-            gate3.set()
-            
-            gate2.clear()
-            gate1.set() # Release all homes at once (we made sure that they're all waiting on this event)
-            # start_sync.clear()
-            increment = -1
-            # awaiting_taker_response.clear()
-        elif counter == 0:
-            gate1.clear()
-            gate2.set()
-            increment = 1
