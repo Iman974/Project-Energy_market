@@ -1,28 +1,45 @@
 from sysv_ipc import MessageQueue, IPC_CREAT, BusyError
-from multiprocessing import Process, Semaphore, Event, Lock
-from math import intm
+from multiprocessing import Process, Event, Lock, current_process
+import time
+import signal
+from random import randint
 
-HOMES_COUNT = 1
-START_CONSUMPTION_RATE = 1.6
-START_PRODUCTION_RATE = 1
-TRADE_POLICY = "GIVE_ONLY" # or "SELL_ONLY" or "SELL_IF_NONE" ()
+HOMES_COUNT = 5
+START_CONSUMPTION_RATE = 1.1
+START_PRODUCTION_RATE = 1.6
+
+class Policy:
+    GIVE_ONLY = "GIVE_ONLY"
+    SELL_ONLY = "SELL_ONLY"
+    SELL_IF_NONE = "SELL_IF_NONE"
+
+    names = [GIVE_ONLY, SELL_ONLY, SELL_IF_NONE]
+
+    @classmethod
+    def getRandom(cls) -> str:
+        return cls.names[randint(0, len(cls.names)-1)]
+
+    def __init__(self):
+        raise Exception("Policy objects cannot be instanciated.")
 
 # Synchronization primitives
 awaiting_takers = Event()
 givers_advertisment = Event()
 taker = Lock()
 sync_event = Event()
-lock = Lock()
+next_tick = Event()
 
 # TODO LIST
 # - replace the TRADE_POLICY strings with vars to avoid mistakes (?)
 # - catch SIGINT to close msq queue
 # - Handle the SIGINT error if it is stuck on semaphore or event (check docs) when simulation is stopped
-# - If lock works inside MsgQueueCountdown, then put it inside
 # - Make sure that no lock acquire/release is missing in MsgQueueCounter
+# - Sell on market the remaining energy that was not taken by needy homes in SELL_IF_NONE policy
 
 KEY = 257
 msg_queue = MessageQueue(KEY, flags=IPC_CREAT)
+
+timestamp = 0
 
 # weather hard-coded
 temperature = 25 # °C
@@ -31,36 +48,37 @@ temperature = 25 # °C
 # Represents an atomic countdown stored in a message queue.
 class MsgQueueCounter:
 
-    # lock = Lock()
-
     # Type of the message used to store the counter, must be unused by other interactions with the queue
-    MSG_TYPE = 999999
+    MSG_TYPE = 999
 
+    # Msg queue must be opened prior to instanciation
     def __init__(self, start_value, queue):
-        self.countdown = start_value
+        self.value = start_value
         self.start_value = start_value
         self.msg_queue = queue
 
-        self.setValue(start_value)
+        self.msg_queue.send(str(start_value).encode(), type=self.MSG_TYPE)
 
-    # Increment by given amount and returns its updated value.
+    # Increment counter by given amount and return its updated value.
     def increment(self, amount) -> int:
-        #with self.lock:
-        with lock:
-            current_value = int(msg_queue.receive()[0].decode(), type=self.MSG_TYPE)
-            updated_value = current_value + amount
-            self.countdown = updated_value
+        current_value = int(msg_queue.receive(type=self.MSG_TYPE)[0].decode())
 
+        # print("Counter value:", current_value)
+        updated_value = current_value + amount
+        self.value = updated_value
         self.msg_queue.send(str(updated_value).encode(), type=self.MSG_TYPE)
+        # print("Return counter val:", updated_value)
         return updated_value
 
     def setValue(self, value):
-        self.increment(value - self.countdown)
+        self.increment(value - self.value)
 
-# Sync object
-atomic_counter = MsgQueueCounter(HOMES_COUNT, msg_queue)
+# Sync objects
+atomic_counter = MsgQueueCounter(0, msg_queue)
 
 class Home(Process):
+    
+    # timestamp = 0 # Move it in parent process
 
     def __init__(self, id : int, trade_policy : str):
         super().__init__()
@@ -72,25 +90,30 @@ class Home(Process):
     # Allows for home to sync. Calling this each round ensures the ticks do not mix,
     # i.e. tick N (present) is not mixed with ticks N-1 (past) or N+1 (future).
     # The on_sync function will be called only once, just before releasing all processes.
-    def sync_all_homes(on_sync = (lambda: None)):
+    def sync_all_homes(self, on_sync = (lambda: None)):
         if atomic_counter.increment(1) == HOMES_COUNT:
             atomic_counter.setValue(0)
             on_sync()
             sync_event.set()
+        else:
+            sync_event.wait()
+        sync_event.clear()
 
-        sync_event.wait()
-
-    def on_sync():
+    def on_tick_end(self):
+        next_tick.set()
         # We assume that there will be no takers or givers by default
         givers_advertisment.set()
         awaiting_takers.set()
 
+        time.sleep(1)
+
     def run(self):
         while True:
-            self.sync_all_homes(self.on_sync)
             energy_delta = self.production_rate - self.consumption_rate
+            print(current_process().name + ":", f"D(E)= {energy_delta:.2f}", "[" + self.trade_policy + "]")
 
-            if energy_delta > 0 and self.trade_policy == "GIVE_ONLY" or self.trade_policy == "SELL_IF_NONE":
+            if energy_delta > 0 and (self.trade_policy == Policy.GIVE_ONLY or \
+                    self.trade_policy == Policy.SELL_IF_NONE):
                 # GIVER
                 givers_advertisment.clear() # Takers, if any, will be waiting for givers
             elif energy_delta < 0: # TAKER
@@ -115,6 +138,7 @@ class Home(Process):
                     except BusyError:
                         # All surplus advertisments were taken homes, buy on market
                         # TODO: Market transaction (always)
+                        print(current_process().name, "buys from market")
                         break
                     surplus = float(surplus_advertisment.decode())
                     energy_received = min(surplus, -energy_delta) # energy_delta is < 0
@@ -136,7 +160,9 @@ class Home(Process):
 
             if energy_delta > 0:
 
-                if self.trade_policy == "GIVE_ONLY":
+                if self.trade_policy == Policy.SELL_ONLY:
+                    print(current_process().name, "sells on market")
+                else:
                     surplus_advertisment = f"{energy_delta}"
                     msg_queue.send(surplus_advertisment.encode(), type=self.id)
 
@@ -147,18 +173,38 @@ class Home(Process):
                     except BusyError:
                         # All surplus was taken by needy homes, end of the day
                         break
-                    # TODO: If SELL_IF_NONE, sell on market the remaining energy that was not taken by needy homes
-                elif self.trade_policy == "SELL_ONLY":
-                    pass
-                else: # SELL_IF_NONE
-                    pass # check in mq for 'in need' request. If none, sell immediately
+                    
+                    # TODO: Sell on market the remaining energy that was not taken by needy homes
+                    if self.trade_policy == Policy.SELL_IF_NONE:
+                        print(current_process().name, "sells on market")
 
-            print(f"Energy remaining: {self.energy:.2f}")
+            self.sync_all_homes(self.on_tick_end)
+
+
+def handle_interrupt(*args):
+    for h in homes:
+        h.terminate()
+    msg_queue.remove()
+    print("-----------------END OF SIMULATION--------------------")
+    exit(0)
 
 if __name__ == "__main__":
-    timestamp = 0
+    signal.signal(signal.SIGINT, handle_interrupt)
 
-    homes = [Home(id=(i+1)) for i in range(HOMES_COUNT)]
+    givers_advertisment.set()
+    awaiting_takers.set()
+
+    homes = [Home(id=(i+1), trade_policy=Policy.getRandom()) for i in range(HOMES_COUNT)]
     for h in homes:
         h.start()
-    print("~~", timestamp, "~~")
+
+    while True:
+        next_tick.wait()
+        next_tick.clear()
+
+        print("~~", timestamp, "~~")
+        timestamp += 1
+
+    # for h in homes:
+    #     h.join()
+    # msg_queue.remove()
