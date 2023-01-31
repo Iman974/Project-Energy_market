@@ -45,11 +45,10 @@ def handle_tick(tick_socket):
     global energy_cost
     timestamp = 0
     with tick_socket:
-        print("wait for tick update")
-        # Wait for tick update
         while True:
             timestamp += 1
-            print("~~", timestamp, "~~")
+            print("~~ market:", timestamp, "~~")
+            # Wait for tick update
             tick_notif = tick_socket.recv(1024)
             if not len(tick_notif):
                 break
@@ -71,8 +70,6 @@ if __name__ == "__main__":
             executor.submit(handle_tick, tick_socket)
 
             while True:
-                # on_going_transactions.acquire()
+                on_going_transactions.acquire()
                 home_socket, address = server_socket.accept()
-                # handler = Thread(target=handle_transaction, args=(client_socket, address))
-                # handler.start()
                 executor.submit(handle_transaction, home_socket, address)

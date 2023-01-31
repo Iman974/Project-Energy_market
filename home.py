@@ -253,7 +253,7 @@ if __name__ == "__main__":
         tick_socket.sendall(tick_notif)
 
         timestamp += 1
-        print("~~", timestamp, "~~")
+        print("~~ homes:", timestamp, "~~")
 
     # for h in homes:
     #     h.join()
