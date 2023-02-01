@@ -12,16 +12,12 @@ class MsgQueueCounter:
         self.msg_queue.send(str(start_value).encode(), type=self.msg_type)
 
     # Increment counter by given amount and return its updated value.
-    def increment(self, amount, do_print=False) -> int:
+    def increment(self, amount) -> int:
         current_value = int(self.msg_queue.receive(type=self.msg_type)[0].decode())
-
-        if do_print:
-            print("Counter value:", current_value)
         updated_value = current_value + amount
         self.value = updated_value
         self.msg_queue.send(str(updated_value).encode(), type=self.msg_type)
-        if do_print:
-            print("Updated counter val:", updated_value)
+
         return updated_value
 
     def setValue(self, value):

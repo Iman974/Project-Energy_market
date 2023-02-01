@@ -39,7 +39,7 @@ class Home(Process):
     taker = Lock()
     tick_start = Semaphore(0)
     tick_end = Semaphore(0)
-    enter_gate = Event()
+    entry_gate = Event()
     exit_gate = Event()
     
     # Sync objects
@@ -57,18 +57,16 @@ class Home(Process):
     def market_transaction(self, type: str, energy_amount: int):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as home_socket:
             home_socket.connect((MARKET_HOST, MARKET_PORT))
-            # print(current_process().name, type, "from/to market")
             home_socket.sendall((f"{type} {energy_amount}").encode())
-            # print(current_process().name, "transaction ended")
 
-    # Allows for home to sync. Calling this each round ensures the ticks do not mix,
+    # Allows for homes to sync. Calling this each round ensures the ticks do not mix,
     # i.e. tick N (present) is not mixed with ticks N-1 (past) or N+1 (future).
     # The callback will be called only once, just before releasing all home processes.
     @classmethod
     def sync_all_homes(cls, on_sync_callback = (lambda: None), *args):
-        Home.enter_gate.wait()
+        Home.entry_gate.wait()
         if Home.sync_counter.increment(1) == HOMES_COUNT:
-            Home.enter_gate.clear()
+            Home.entry_gate.clear()
             on_sync_callback(*args)
             Home.exit_gate.set()
 
@@ -76,7 +74,7 @@ class Home(Process):
 
         if Home.sync_counter.increment(-1) == 0:
             Home.exit_gate.clear()
-            Home.enter_gate.set()
+            Home.entry_gate.set()
 
     @classmethod
     def on_tick_sync(cls):
@@ -93,7 +91,7 @@ class Home(Process):
 
             self.consumption_rate = self.avg_consumption + (1/temperature.value)
             energy_delta = self.production_rate - self.consumption_rate
-            print(current_process().name + ":", f"D(E)= {energy_delta:.2f}", "[" + self.trade_policy + "]")
+            print(f"{self.id}: Delta(E)= {energy_delta:.2f} [{self.trade_policy}]")
 
             if energy_delta > 0 and self.trade_policy != Policy.SELL_ONLY:
                 # GIVER
@@ -106,7 +104,6 @@ class Home(Process):
 
             # TAKER
             if energy_delta < 0:
-                # Ask other homes for giveaway, wait for a reply, and if none, buy from market
                 Home.taker_counter.increment(1)
                 Home.taker.acquire()
                 while True:
@@ -117,21 +114,17 @@ class Home(Process):
                         # range [1,HOMES_COUNT], we can use the remaining types for other purposes
                         # (e.g. countdown), because we only retrieve messages which types are <= HOMES_COUNT.
                         surplus_advertisment, giver_id = msg_queue.receive(type=-HOMES_COUNT, block=False)
-                        # print(self.id, "received energy from home", giver_id)
                     except BusyError:
-                        # All surplus advertisments were taken homes, buy on market
-                        # print(current_process().name, "initiates buy from market")
+                        # All surplus advertisments were taken homes
                         self.market_transaction("BUY", -energy_delta)
                         break
                     surplus = float(surplus_advertisment.decode())
                     energy_received = min(surplus, -energy_delta)
                     remaining_energy = surplus - energy_received
-                    # print(f"\n Giver-{giver_id} now has", remaining_energy)
 
                     # Put back in the msg queue only if the 'packet' still contains energy
                     if remaining_energy > 0:
-                        # print("Putting back in queue: ", remaining_energy, f"from Giver-{giver_id}")
-                        # Surplus from other home was enough to meed need of energy.
+                        # Surplus from giver home was enough to meed energy needs.
                         msg_queue.send(str(remaining_energy).encode(),type=giver_id)
                         break
                     else:
@@ -142,12 +135,11 @@ class Home(Process):
                 if Home.taker_counter.increment(-1) == 0:
                     Home.awaiting_takers.set()
 
-            if energy_delta > 0:
-
+            elif energy_delta > 0:
                 if self.trade_policy == Policy.SELL_ONLY:
-                    # print(current_process().name, "initiate sell on market")
                     self.market_transaction("SELL", energy_delta)
                 else:
+                    # GIVER
                     surplus_advertisment = f"{energy_delta}"
                     msg_queue.send(surplus_advertisment.encode(), type=self.id)
 
@@ -159,10 +151,8 @@ class Home(Process):
                         remaining_energy = float(msg_queue.receive(type=self.id, block=False)[0].decode())
 
                         if self.trade_policy == Policy.SELL_IF_NONE:
-                            # print(current_process().name, "sells on market")
                             self.market_transaction("SELL", remaining_energy)
 
                     except BusyError:
-                        # All surplus was taken by needy homes, end of the day
-                        # print(current_process().name, ": all surplus given")
+                        # All surplus was taken by needy homes, end of the tick
                         pass

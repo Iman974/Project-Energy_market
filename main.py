@@ -18,17 +18,15 @@ if __name__ == "__main__":
     homes_end = Home.tick_end
 
     # These gates are 'opened' by default
-    Home.enter_gate.set()
-    Home.enter_gate.set()
+    Home.entry_gate.set()
+    Home.entry_gate.set()
 
-    global weather_process
     weather_process = Process(target=weather.run_weather, args=(weather_start, weather_end))
     market_process = Process(target=market.run_market, args=(market_start, market_end))
     weather_process.start()
     market_process.start()
 
     homes = []
-
     for i in range(HOMES_COUNT):
         production_rate = rand_range(MIN_PRODUCTION_RATE, MAX_PRODUCTION_RATE)
         consumption_rate = rand_range(MIN_CONSUMPTION_RATE, MAX_CONSUMPTION_RATE)

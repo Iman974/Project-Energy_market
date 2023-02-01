@@ -1,6 +1,6 @@
 import socket
 from threading import Lock, Semaphore
-from multiprocessing import Process
+from multiprocessing import Process, Value
 from concurrent.futures import ThreadPoolExecutor
 from weather import temperature
 from external import run_external, event_types
@@ -12,11 +12,9 @@ MIN_ENERGY_PRICE = 0.05
 MAX_TRANSACTIONS = 3
 
 MARKET_HOST = "localhost"
-MARKET_PORT = randrange(2000, 40000)
-print("market_port:", MARKET_PORT)
+MARKET_PORT = randrange(2000, 40000) # Using random to avoid "Address already in use" error
 
-# -----------------
-
+# Sync primitives
 on_going_transactions = Semaphore(MAX_TRANSACTIONS)
 transaction_lock = Lock()
 
@@ -29,11 +27,11 @@ ALPHA_TEMPERATURE = 0.5
 ALPHA_SOLD = 0.03
 ALPHA_BOUGHT = -0.01
 
-energy_bought = 0
-energy_sold = 0
-
 external_events = [0 for i in range(len(event_types))]
 external_modulators = [0.3, 0.15]
+
+energy_bought = 0
+energy_sold = 0
 
 def handle_transaction(home_socket):
     global energy_sold, energy_bought
@@ -56,9 +54,9 @@ def handle_transaction(home_socket):
 
 def handle_tick(tick_start, tick_end):
     timestamp = 0
-
     while True:
         tick_start.acquire()
+        timestamp += 1
 
         update_energy()
         reset_factors()
@@ -67,13 +65,12 @@ def handle_tick(tick_start, tick_end):
         print("##################\n")
 
         tick_end.release()
-        
+
 def update_energy():
     global energy_cost, past_energy_cost
 
     temperatureVal = temperature.value
     internals = ALPHA_TEMPERATURE * (1/temperatureVal) + energy_bought * ALPHA_BOUGHT + energy_sold * ALPHA_SOLD
-    # externals = sum(map(lambda event, beta: event*beta, external_events, external_modulators))
     print(f"Sold on market: {energy_sold:.2f}, | Bought from market: {energy_bought:.2f}")
     externals = external_modulators[0] * external_events[0] + external_modulators[1] * external_events[1]
     past_energy_cost, energy_cost = energy_cost, GAMMA * past_energy_cost + internals + externals
@@ -113,5 +110,5 @@ def run_market(tick_start, tick_end):
 
             while True:
                 on_going_transactions.acquire()
-                home_socket, address = server_socket.accept()
+                home_socket = server_socket.accept()[0]
                 executor.submit(handle_transaction, home_socket)
