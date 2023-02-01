@@ -1,26 +1,16 @@
-from multiprocessing import Process, Value, Event
+from multiprocessing import Value
 from random import random
 
-temperature = Value("f", 25.0)
+temperature = Value("f", 20.0)
 
-def weather_process(tick_update: Event):
+def run_weather(tick_start, tick_end):
+    AVG_TEMPERATURE = 20
+    AMPLITUDE = 15
+
     timestamp = 0
     while True:
-        tick_update.wait()
-        tick_update.clear()
-
-        timestamp += 1
-        print("~~ weather:", timestamp, "~~")
-
-        with temperature.get_lock():
-            temperature.value += random()
-
-# class Weather(Process):
-
-#     temperature = Value("f", 25.0)
-
-#     def __init__(self, ):
-#         super().__init__()
-
-#     def update():
-#         pass
+        tick_start.acquire()
+        
+        temperature.value = AVG_TEMPERATURE + (2*random()-1) * AMPLITUDE
+        print(f"Temperature: {temperature.value:.1f}°C")
+        tick_end.release()
