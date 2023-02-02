@@ -4,6 +4,7 @@ import time
 from random import random
 
 event_types = {"war", "fuel_shortage"}
+external_modulators = [0.2, 0.07]
 
 def run_external():
     DELAY = 2

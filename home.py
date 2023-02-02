@@ -1,6 +1,6 @@
 from sysv_ipc import MessageQueue, IPC_CREAT, BusyError
-from multiprocessing import Process, Event, Lock, current_process, Semaphore
-from random import randrange, random
+from multiprocessing import Process, Event, Lock, Semaphore
+from random import randrange
 import socket
 from utility import MsgQueueCounter
 from market import MARKET_HOST, MARKET_PORT
@@ -91,7 +91,7 @@ class Home(Process):
 
             self.consumption_rate = self.avg_consumption + (1/temperature.value)
             energy_delta = self.production_rate - self.consumption_rate
-            print(f"{self.id}: Delta(E)= {energy_delta:.2f} [{self.trade_policy}]")
+            print(f"Home-{self.id}: Delta(E)= {energy_delta:.2f} [{self.trade_policy}]")
 
             if energy_delta > 0 and self.trade_policy != Policy.SELL_ONLY:
                 # GIVER
@@ -112,7 +112,7 @@ class Home(Process):
                     try:
                         # Using -HOMES_COUNT as msg type, and the convention of giving each home an id in the
                         # range [1,HOMES_COUNT], we can use the remaining types for other purposes
-                        # (e.g. countdown), because we only retrieve messages which types are <= HOMES_COUNT.
+                        # (e.g. counter), because we only retrieve messages which types are <= HOMES_COUNT.
                         surplus_advertisment, giver_id = msg_queue.receive(type=-HOMES_COUNT, block=False)
                     except BusyError:
                         # All surplus advertisments were taken homes
